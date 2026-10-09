@@ -199,7 +199,8 @@ count
 
 **Evidence:** 
 	 Counted case-insensitively, there are 74,094 check-ins (73,913 check_in plus 181 CHECK_IN) against 73,205 check_out events: a gap of 889. 
-	 Counted lowercase-only, the gap looks like 708, which understates it, because the 181 uppercase check-ins did check out and their check-outs are inside the 73,205.
+	 Counted lowercase-only, the gap looks like 708, which understates it, because the 181 uppercase check-ins did check out and their check-outs are inside the 73,205
+	 The gap matters as a control, and that exact reconciliation would itself be suspicious
 
 SELECT lower(event_type) AS event_type, count(*)
 FROM events
@@ -307,10 +308,10 @@ ORDER BY copies DESC, source_ref;
 	Members kept walking in after their membership was cancelled. 
 	A check-in counts here when the member's latest membership event at that moment was membership_cancelled, 
 	with no membership_reactivated before the visit. 
-	In other words, the CRM said these people were no longer members, and the turnstiles let them in anyway.
+	Membership enforcement is soft chain-wide, and broken at branch 3.
 
 **Evidence:** 
-	302 check-ins by 30 distinct members happened while the member was in cancelled state
+	302 check-ins by 30 distinct members, mostly in branch 3, happened while the member was in cancelled state
 
 WITH lifecycle AS (
     SELECT member_id, event_ts, lower(event_type) AS event_type
@@ -319,7 +320,7 @@ WITH lifecycle AS (
           ('membership_started', 'membership_reactivated', 'membership_cancelled')
 ),
 state AS (
-    SELECT c.member_id, c.event_ts,
+    SELECT c.member_id, c.branch_id, c.event_ts,
            (SELECT l.event_type FROM lifecycle l
              WHERE l.member_id = c.member_id
                AND l.event_ts <= c.event_ts
@@ -327,15 +328,26 @@ state AS (
     FROM events c
     WHERE lower(c.event_type) = 'check_in'
 )
-SELECT count(*) AS visits_while_cancelled,
+SELECT branch_id,
+       count(*) AS visits_while_cancelled,
        count(DISTINCT member_id) AS members
 FROM state
-WHERE last_event = 'membership_cancelled';
+WHERE last_event = 'membership_cancelled'
+GROUP BY branch_id
+ORDER BY branch_id;
 
- visits_while_cancelled | members
-------------------------+---------
-                    302 |      30
-(1 row)
+ branch_id | visits_while_cancelled | members
+-----------+------------------------+---------
+         1 |                      5 |       4
+         2 |                      6 |       5
+         3 |                    278 |      29
+         4 |                      4 |       4
+         5 |                      2 |       2
+         6 |                      3 |       3
+         7 |                      2 |       2
+         8 |                      2 |       1
+(8 rows)
+
 
 
 **Severity:**
@@ -349,21 +361,62 @@ WHERE last_event = 'membership_cancelled';
 
 ## Root causes
 
-To be completed after grouping findings that share the same cause.
+The findings group into four sources:
+
+1. 	The CRM event stream is not guaranteed complete (Finding 1). 
+	Membership state is supposed to come from events, but members can exist and stay active with no membership_started event, 
+	so the event stream and the member table disagree about who is a member.
+2. 	Access-control ingestion does not validate or normalize (Findings 3 and 6). 
+	The same event can be written twice under one source_ref, and one device sent an uppercase event type for a week. 
+	Both reached the database as-is.
+3. 	Test traffic lives in the production feed (Finding 2). 
+	Member IDs 990001 and 990002 swipe at all 8 branches all year, with no friend visits, and were never cleaned up.
+4. 	Nothing checks membership at the door (Findings 5 and 7). 
+	Cancelled members kept entering, and visits end without a check-out often enough that check-ins outnumber check-outs by 889. 
+	Exit capture and access enforcement are both soft.
 
 ## Questions for the CRM team
 
-To be completed.
+1. 	What writes the membership_started event, and how can a member be created without one? 
+	Are manual member updates allowed to skip the event?
+2. 	Which record drives billing, the member row or the start event? 
+	Were members 1031 and 1132 charged while their membership never formally started?
+3. 	Are 990001 and 990002 CRM accounts that were never provisioned, or IDs that exist only on the access-control side?
+4. 	When a membership is cancelled, how and how quickly does that reach the access-control system?
 
 ## Questions for the access-control team
 
-To be completed.
+1. 	Can you confirm 990001 and 990002 are internal test IDs? 
+	If so, why do they swipe in the production feed, and can test IDs be filtered at ingestion?
+2. 	What changed on device D04-IN during 2024-04-08 to 2024-04-14? Firmware, configuration? 
+	Is event_type normalized anywhere before it is stored?
+3. 	How can one source_ref be written twice? Is there retry logic with no dedup, and can a uniqueness rule be added at ingestion?
+4. 	Do the turnstiles check membership status live, from a cached copy, or not at all? 
+	Cancelled members got in at every branch a few times, but branch 3 (Lakeshore) alone let in 278 of the 302 visits. 
+	What is different at branch 3, and when did its membership copy last sync?
+5. 	Are exit reads ever lost, or do members simply walk out without swiping? 115 check-ins have no later check-out at all.
 
 ## Monitoring from now on
 
-To be completed.
+1. 	Run the data-quality suite on a schedule and alert when it fails. 
+	Sev-1 findings block report publication until fixed or explicitly accepted.
+2. 	Track the same numbers this report found, as trends rather than one-offs: 
+	- check-in/check-out gap (889 today) 
+	- duplicate source_ref groups (331) 
+	- unknown member IDs in events (2) 
+	- check-ins while cancelled (302 visits by 30 members) 
+	- check-ins with no later check-out (115) 
+	- members with no membership_started event (2) 
+	- any new event_type value or case variant.
+3. Re-run the full check set after any CRM change, any device firmware update, and any ingestion change. Findings 3 and 6 both look like they arrived exactly that way.
 
+## Worth checking in the future
 
+1. 	Friend visits per member-month, counted in branch local time and reconciled against tier allowances (basic 2, standard 3, premium 8). 
+	Who exceeds the allowance, by how much, and does the front desk enforce the cap at all? 
+2.	Member travel patterns: how many different branches does each member actually use? 
+	If a large share of members show up at all 8 branches across 4 time zones, that needs a second look: 
+	either memberships genuinely roam nationwide, or member IDs are shared or misattributed.
 
 ## Data checked: baseline checks run
 
