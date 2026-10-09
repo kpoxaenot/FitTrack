@@ -289,7 +289,7 @@ SELECT source_ref, count(*) AS copies,
        max(ingested_at) AS last_ingested
 FROM events
 WHERE lower(event_type) = 'check_in'
-GROUP BY source_ref
+GROUP BY source_ref, event_ts
 HAVING count(*) > 1
 ORDER BY copies DESC, source_ref;
 
