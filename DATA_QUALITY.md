@@ -303,15 +303,49 @@ ORDER BY copies DESC, source_ref;
 
 ### 7. Visits after membership cancellation
 
-**What it is:** Some check-ins happened while the member's membership was cancelled and had not been reactivated before the visit.
+**What it is:** 
+	Members kept walking in after their membership was cancelled. 
+	A check-in counts here when the member's latest membership event at that moment was membership_cancelled, 
+	with no membership_reactivated before the visit. 
+	In other words, the CRM said these people were no longer members, and the turnstiles let them in anyway.
 
-**Evidence:** The cancelled-membership visit query returned 30 grouped member rows. The total visit count should be confirmed before this number is finalized.
+**Evidence:** 
+	302 check-ins by 30 distinct members happened while the member was in cancelled state
+
+WITH lifecycle AS (
+    SELECT member_id, event_ts, lower(event_type) AS event_type
+    FROM events
+    WHERE lower(event_type) IN
+          ('membership_started', 'membership_reactivated', 'membership_cancelled')
+),
+state AS (
+    SELECT c.member_id, c.event_ts,
+           (SELECT l.event_type FROM lifecycle l
+             WHERE l.member_id = c.member_id
+               AND l.event_ts <= c.event_ts
+             ORDER BY l.event_ts DESC LIMIT 1) AS last_event
+    FROM events c
+    WHERE lower(c.event_type) = 'check_in'
+)
+SELECT count(*) AS visits_while_cancelled,
+       count(DISTINCT member_id) AS members
+FROM state
+WHERE last_event = 'membership_cancelled';
+
+ visits_while_cancelled | members
+------------------------+---------
+                    302 |      30
+(1 row)
+
 
 **Severity:**
-
+	Sev-1
 **Reports affected:**
+	visits_per_branch counts these as ordinary visits: roughly 300 of 70,824, about 0.4 percent
+	Nothing in the report can tell them apart from legitimate visits.
 
 **Likely cause:**
+	Access control does not check membership state at the door, or it checks a stale copy: the cancellation exists in the CRM event stream, but the turnstile let them in anyway.
 
 ## Root causes
 
