@@ -93,6 +93,17 @@ SELECT branch_id, count(*) FROM events WHERE member_id IN (990001, 990002) GROUP
          8 |    70
 (8 rows)
 
+SELECT event_type, count(*)
+FROM events
+WHERE member_id IN (990001, 990002)
+GROUP BY event_type;
+
+ event_type | count
+------------+-------
+ CHECK_IN   |     1
+ check_in   |   413
+ check_out  |   414
+(3 rows)
 
 **Severity:**
 	Sev-3
@@ -103,7 +114,8 @@ SELECT branch_id, count(*) FROM events WHERE member_id IN (990001, 990002) GROUP
 	Test or probe accounts in the access-control feed that were never cleaned up 
 	The even branch spread, the balanced ins and outs, and the absence of friend visits all point that way
 **Comments:**
-	Question for the access-control owner: can you confirm 990001 and 990002 are internal test IDs, and not real access by unknown cards?
+	Question for the access-control owner: can you confirm 990001 and 990002 are internal test IDs, and not real access by unknown cards? 
+	If they are test IDs, they should be filtered or removed at ingestion
 
 ### 3. Uppercase `CHECK_IN` events at branch 4
 
@@ -181,55 +193,119 @@ count
 
 ### 4. Check-in and check-out totals do not reconcile
 
-**What it is:** There are more check-in events than check-out events. This is a reconciliation gap that needs to be explained by the more specific pairing findings below.
+**What it is:** 
+	A basic reconciliation control: over a full year, check-ins and check-outs should match, since every visit that starts should end. 
+	They do not: check-ins outnumber check-outs by 889. This finding is the control total; the causes underneath it are the visits that never closed and the duplicate check-ins (see Findings below)
 
-**Evidence:** 73,913 lowercase `check_in` events vs 73,205 `check_out` events, a difference of 708 before the 181 uppercase `CHECK_IN` events are considered.
+**Evidence:** 
+	 Counted case-insensitively, there are 74,094 check-ins (73,913 check_in plus 181 CHECK_IN) against 73,205 check_out events: a gap of 889. 
+	 Counted lowercase-only, the gap looks like 708, which understates it, because the 181 uppercase check-ins did check out and their check-outs are inside the 73,205.
+
+SELECT lower(event_type) AS event_type, count(*)
+FROM events
+WHERE lower(event_type) IN ('check_in', 'check_out')
+GROUP BY lower(event_type);
+
+ event_type | count
+------------+-------
+ check_in   | 74094
+ check_out  | 73205
+(2 rows)
+
 
 **Severity:**
+	Sev-3
 
 **Reports affected:**
+	None directly. 
+	The delivered visit reports require a check-out before counting a visit, so unclosed check-ins never inflate them. 
+	The gap matters as a control: if these two totals ever reconcile exactly, something else is wrong.
 
 **Likely cause:**
+	Two components, both proven separately below: some visits genuinely never record a check-out and duplicated check-in rows inflate the check-in side 
 
+### 5. Some check-ins never close cleanly
 
+**What it is:** 
+	Some visits start but never properly end. 115 check-ins have no later check-out at all for the same member at the same branch: those visits are lost completely. 
+	Under the stricter rule that the member's next event at that branch must be the check-out, 1,424 check-ins (about 2 percent of 74,094) fail. 
+	
+**Evidence:** 
 
-### 5. Phantom member activity is spread across all branches
+SELECT count(*)
+FROM events ci
+WHERE lower(ci.event_type) = 'check_in'
+  AND NOT EXISTS (
+      SELECT 1 FROM events co
+      WHERE co.member_id = ci.member_id
+        AND co.branch_id = ci.branch_id
+        AND lower(co.event_type) = 'check_out'
+        AND co.event_ts > ci.event_ts
+  );
+  
+   count
+-------
+   115
+(1 row)
 
-**What it is:** The two missing member IDs are not a one-off local problem. Their activity is spread across all 8 branches in an almost even pattern, which makes it look more like test or probe traffic than normal member activity.
-
-**Evidence:** 828 event rows for member_id in (990001, 990002). Branch distribution: 109 at branch 1, 108 at branches 2, 3, 4, 5 and 7, 109 at branch 6, and 70 at branch 8. Both member IDs span the full 2024 access period.
+SELECT count(*)
+FROM (
+    SELECT lower(event_type) AS event_type,
+           lead(lower(event_type)) OVER (
+               PARTITION BY member_id, branch_id
+               ORDER BY event_ts, event_id
+           ) AS next_event_type
+    FROM events
+    WHERE lower(event_type) IN ('check_in', 'check_out')
+) s
+WHERE s.event_type = 'check_in'
+  AND s.next_event_type IS DISTINCT FROM 'check_out';
+  
+ count
+-------
+  1424
+(1 row)  
 
 **Severity:**
-
+	Sev-2
 **Reports affected:**
-
-**Likely cause:** Possible test/probe accounts; needs confirmation from the CRM and access-control owners.
-
-### 6. Some check-ins never close cleanly
-
-**What it is:** Some visits start with a check-in but do not end cleanly with a matching check-out. The size of the problem depends on how strictly visits are paired.
-
-**Evidence:** 115 check-ins have no later check-out at all for the same member at the same branch. Under stricter next-event logic, 1,424 check-ins are not followed by a check-out as the member's next event at that branch.
-
-**Severity:**
-
-**Reports affected:**
-
+	visits_per_branch and daily_visits
+	Both count only completed visits, so unclosed check-ins never appear: up to 1,424 visits, about 2 percent of all check-ins, spread across members and branches. 
 **Likely cause:**
+	Members leaving without swiping out, missed exit reads, or check-out events lost before ingestion. 
+	Part of the 1,424 overlaps with the next Finding (6): duplicated check-in also makes the genuine check-in look unclosed under next-event logic
 
-### 7. Duplicate check-ins at the same second
+### 6. Duplicate check-ins at the same second
 
-**What it is:** The same member sometimes has two check-ins at the same branch in the exact same second. That pattern points to duplicate ingestion rather than two real entries.
+**What it is:** 
+	Ingestion sometimes writes the same device event more than once. 
+	The copies share one source_ref and one event_ts, and differ only in ingested_at. so one physical entry becomes two check-ins
 
-**Evidence:** 331 duplicate same-second check-in groups, involving 662 check-in rows. In one inspected pair, the two rows had the same `source_ref` and the same `event_ts`, but different `ingested_at` values.
+**Evidence:** 
+	331 duplicated source_ref groups among check-ins, 662 rows; some source_ref values appear 3 times. 
+	Inspected pair: D01-IN:0002169, identical event_ts, two different ingested_at values.
+
+SELECT source_ref, count(*) AS copies,
+       min(event_ts) AS event_ts,
+       min(ingested_at) AS first_ingested,
+       max(ingested_at) AS last_ingested
+FROM events
+WHERE lower(event_type) = 'check_in'
+GROUP BY source_ref
+HAVING count(*) > 1
+ORDER BY copies DESC, source_ref;
+
+(too many resulting rows to copy)
 
 **Severity:**
-
+	Sev-2
 **Reports affected:**
-
+	Any count built on check-ins. Without deduplication, visits_per_branch and daily_visits would each count about 331 phantom extra visits. 
+	The delivered report avoid it only because of dedup by source_ref.
 **Likely cause:**
+	Duplicate ingestion with nothing stopping it: no unique constraint and no dedup on source_ref, so a retried write lands as a second row
 
-### 8. Visits after membership cancellation
+### 7. Visits after membership cancellation
 
 **What it is:** Some check-ins happened while the member's membership was cancelled and had not been reactivated before the visit.
 
