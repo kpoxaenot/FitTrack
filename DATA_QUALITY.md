@@ -45,8 +45,8 @@ WHERE NOT EXISTS (
 )
 ORDER BY m.member_id;
 
- member_id | first_name | last_name | home_branch_id | joined_on  | membership_tier | status
--++-+++-+
+member_id | first_name | last_name | home_branch_id | joined_on  | membership_tier | status
+-----------+------------+-----------+----------------+------------+-----------------+--------
       1031 | Ella       | Nelson    |              7 | 2021-04-03 | basic           | active
       1132 | Jacob      | Hill      |              4 | 2021-12-09 | premium         | active
 (2 rows)
@@ -80,8 +80,9 @@ SELECT count(*) FROM events WHERE member_id IN (990001, 990002);
 (1 row)
 
 SELECT branch_id, count(*) FROM events WHERE member_id IN (990001, 990002) GROUP BY branch_id ORDER BY branch_id;
+ 
  branch_id | count
--+-
+-----------+-------
          1 |   109
          2 |   108
          3 |   108
@@ -91,6 +92,7 @@ SELECT branch_id, count(*) FROM events WHERE member_id IN (990001, 990002) GROUP
          7 |   108
          8 |    70
 (8 rows)
+
 
 **Severity:**
 	Sev-3
@@ -105,15 +107,77 @@ SELECT branch_id, count(*) FROM events WHERE member_id IN (990001, 990002) GROUP
 
 ### 3. Uppercase `CHECK_IN` events at branch 4
 
-**What it is:** The events table contains both `check_in` and uppercase `CHECK_IN` event types. The uppercase form appears only at branch 4 and only from device D04-IN, during one week in April 2024.
+**What it is:** 
+	The event_type vocabulary is not normalized: alongside 73,913 lowercase check_in events there are 181 CHECK_IN events in uppercase. 
+	All 181 come from one device, D04-IN at branch 4 (Riverwalk), in one week, 2024-04-08 to 2024-04-14. 
+	These are real visits, each has a later check-out for the same member at the same branch, so any count that matches check_in exactly and case-sensitively silently loses 181 branch 4 visits.
 
-**Evidence:** 73,913 lowercase `check_in` events vs 181 uppercase `CHECK_IN` events. All 181 uppercase rows are from branch 4, device D04-IN, between 2024-04-08 and 2024-04-14. All 181 later have a check-out for the same member at the same branch under the loose matching check.
+**Evidence:** 
+SELECT event_type, count(*)
+FROM events
+WHERE lower(event_type) = 'check_in'
+GROUP BY event_type;
+
+ event_type | count
+------------+-------
+ check_in   | 73913
+ CHECK_IN   |   181
+(2 rows)
+
+SELECT branch_id, device_id, min(event_ts) AS first_seen, max(event_ts) AS last_seen, count(*)
+FROM events
+WHERE event_type = 'CHECK_IN'
+GROUP BY branch_id, device_id;
+
+ branch_id | device_id |       first_seen       |       last_seen        | count
+-----------+-----------+------------------------+------------------------+-------
+         4 | D04-IN    | 2024-04-08 06:08:36-04 | 2024-04-14 22:00:32-04 |   181
+(1 row)
+
+SELECT count(*)
+FROM events ci
+WHERE ci.event_type = 'CHECK_IN'
+  AND EXISTS (
+      SELECT 1
+      FROM events co
+      WHERE co.member_id = ci.member_id
+        AND co.branch_id = ci.branch_id
+        AND lower(co.event_type) = 'check_out'
+        AND co.event_ts > ci.event_ts
+  );
+
+ count
+-------
+   181
+(1 row)
+
+SELECT count(*)
+FROM events ci
+WHERE ci.event_type = 'CHECK_IN'
+  AND NOT EXISTS (
+      SELECT 1
+      FROM events co
+      WHERE co.member_id = ci.member_id
+        AND co.branch_id = ci.branch_id
+        AND lower(co.event_type) = 'check_out'
+        AND co.event_ts > ci.event_ts
+  );
+  
+count
+-------
+     0
+(1 row)
 
 **Severity:**
+	Sev-2
 
-**Reports affected:** Any report filtering only on lowercase `check_in` would miss these 181 branch 4 visits unless it handles the uppercase form.
+**Reports affected:** 
+	visits_per_branch, daily_visits, both limited to branch 4. 
+	A counter that matches check_in exactly loses 181 of branch 4's roughly 9,300 visits, about 2 percent; 
+	the reports count them because matching is case-insensitive.
 
 **Likely cause:**
+	Device D04-IN at Riverwalk sent an uppercase event type for one week, 2024-04-08 to 2024-04-14, most plausibly a firmware or configuration change on that one device that was rolled back the next week.
 
 ### 4. Check-in and check-out totals do not reconcile
 
