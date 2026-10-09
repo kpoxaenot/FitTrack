@@ -54,8 +54,8 @@ member_id | first_name | last_name | home_branch_id | joined_on  | membership_ti
 **Severity:**
 	Sev-2
 **Reports affected:**
-	active_members_monthly (2 members never counted) 
-	visits_per_branch and daily_visits (their visits excluded at the join)
+	visits_per_branch: their visits are excluded at the join to members 
+	Any monthly active-members count built from events would also miss both members entirely
 **Likely cause:**
 	The CRM membership creation flow. Either it sometimes fails to write the membership_started event, or these two members were created by a manual update that skipped the event. 
 	Their home branches differ (7 and 4), so it is not one branch's local problem.
@@ -108,8 +108,8 @@ GROUP BY event_type;
 **Severity:**
 	Sev-3
 **Reports affected:**
-	None of the delivered reports: all of them join to members, so this activity is excluded
-	Any future count taken from events alone would quietly include 414 fake check-ins
+	None of the delivered reports: visits_per_branch joins to members, so this activity is excluded
+	Any count taken from events alone would quietly include 414 fake check-ins
 **Likely cause:**	
 	Test or probe accounts in the access-control feed that were never cleaned up 
 	The even branch spread, the balanced ins and outs, and the absence of friend visits all point that way
@@ -184,9 +184,9 @@ count
 	Sev-2
 
 **Reports affected:** 
-	visits_per_branch, daily_visits, both limited to branch 4. 
+	visits_per_branch, limited to branch 4. 
 	A counter that matches check_in exactly loses 181 of branch 4's roughly 9,300 visits, about 2 percent; 
-	the reports count them because matching is case-insensitive.
+	the delivered report counts them because matching is case-insensitive
 
 **Likely cause:**
 	Device D04-IN at Riverwalk sent an uppercase event type for one week, 2024-04-08 to 2024-04-14, most plausibly a firmware or configuration change on that one device that was rolled back the next week.
@@ -217,9 +217,7 @@ GROUP BY lower(event_type);
 	Sev-3
 
 **Reports affected:**
-	None directly. 
-	The delivered visit reports require a check-out before counting a visit, so unclosed check-ins never inflate them. 
-	The gap matters as a control: if these two totals ever reconcile exactly, something else is wrong.
+	visits_per_branch report requires a check-out before counting a visit
 
 **Likely cause:**
 	Two components, both proven separately below: some visits genuinely never record a check-out and duplicated check-in rows inflate the check-in side 
@@ -269,8 +267,7 @@ WHERE s.event_type = 'check_in'
 **Severity:**
 	Sev-2
 **Reports affected:**
-	visits_per_branch and daily_visits
-	Both count only completed visits, so unclosed check-ins never appear: up to 1,424 visits, about 2 percent of all check-ins, spread across members and branches. 
+	visits_per_branch counts only completed visits
 **Likely cause:**
 	Members leaving without swiping out, missed exit reads, or check-out events lost before ingestion. 
 	Part of the 1,424 overlaps with the next Finding (6): duplicated check-in also makes the genuine check-in look unclosed under next-event logic
@@ -300,8 +297,7 @@ ORDER BY copies DESC, source_ref;
 **Severity:**
 	Sev-2
 **Reports affected:**
-	Any count built on check-ins. Without deduplication, visits_per_branch and daily_visits would each count about 331 phantom extra visits. 
-	The delivered report avoid it only because of dedup by source_ref.
+	visits_per_branch would count about 331 phantom extra visits without deduplication
 **Likely cause:**
 	Duplicate ingestion with nothing stopping it: no unique constraint and no dedup on source_ref, so a retried write lands as a second row
 
